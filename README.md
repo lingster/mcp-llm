@@ -73,10 +73,10 @@ uv run mcpllm chat --model claude-3-5-sonnet-20241022 --temperature 0.8 --max-to
 
 ```bash
 # Process a single query and exit
-uv run mcpllm chat --query "What is the current weather in New York?"
+uv run mcpllm chat --query "Is it raining in London?"
 ```
 
-``bash
+```bash
 # tool use
 uv run mcpllm chat --server brave-search --query "Where's wally?"
 ```
