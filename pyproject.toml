@@ -18,8 +18,9 @@ classifiers = [
 ]
 dependencies = [
     "anthropic>=0.49.0",
-    "asyncio>=3.4.3",
+    "anyio>=4.8.0",
     "click>=8.1.7",
+    "litellm>=1.63.14",
     "loguru>=0.7.3",
     "mcp>=0.0.17",
     "python-dotenv>=1.0.0",
@@ -32,3 +33,11 @@ mcpllm = "cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mcp_llm"]
+
+[tool.uv.sources]
+mcp-llm = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "mcp-llm",
+]

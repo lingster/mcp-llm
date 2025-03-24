@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.logging import RichHandler
 
-from mcp_llm import MCPClient
+from mcp_llm.client.litellm import MCPClient
 
 console = Console()
 
@@ -55,9 +55,10 @@ def chat(
             # Initialize client
             client = MCPClient(
                 config_path=config,
-                anthropic_api_key=api_key,
+                #anthropic_api_key=api_key,
                 model=model,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                base_url='http://10.13.1.11:11434',
             )
 
             # Connect to servers
@@ -110,7 +111,7 @@ def chat(
                         break
 
                     # Display assistant response
-                    console.print("[bold purple]Claude:[/]", end=" ")
+                    console.print("\n[bold purple]Github.Me:[/]", end=" ")
 
                     # Process query with streaming
                     async for chunk in await client.process_query(
