@@ -1,16 +1,14 @@
-from enum import Enum
 import os
 import sys
 import json
 from loguru import logger
 from contextlib import AsyncExitStack
-from typing import Any, Dict, List, Optional, AsyncGenerator, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, AsyncGenerator, Tuple
 
 import litellm
-from litellm.utils import StreamingChoices
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.types import Resource, Tool
+from mcp.types import Tool
 
 from ..config import MCPConfig
 
@@ -30,7 +28,7 @@ class MCPClient:
         api_key: Optional[str] = None,
         model: str = "anthropic/claude-3-7-sonnet-20241024",
         max_tokens: int = 4096,
-        base_url: Optional[str] = None
+        base_url: Optional[str] = None,
     ):
         """Initialize the MCP client.
 
@@ -45,20 +43,28 @@ class MCPClient:
         self.model = model
         self.max_tokens = max_tokens
         self.base_url = base_url
-        
+
         # Set API key based on model provider
         if base_url:
             litellm.api_base = base_url
         else:
             # Extract provider from model string
-            provider = model.split('/')[0] if '/' in model else None
-            env_var_name = f"{provider.upper()}_API_KEY" if provider else "LITELLM_API_KEY"
-            
-            self.api_key = api_key or os.environ.get(env_var_name) or os.environ.get("OPENAI_API_KEY")
-            
+            provider = model.split("/")[0] if "/" in model else None
+            env_var_name = (
+                f"{provider.upper()}_API_KEY" if provider else "LITELLM_API_KEY"
+            )
+
+            self.api_key = (
+                api_key
+                or os.environ.get(env_var_name)
+                or os.environ.get("OPENAI_API_KEY")
+            )
+
             if not self.api_key:
-                raise ValueError(f"API key is required. Set {env_var_name} env var or pass it to the constructor.")
-            
+                raise ValueError(
+                    f"API key is required. Set {env_var_name} env var or pass it to the constructor."
+                )
+
             # Configure LiteLLM with the appropriate API key
             if provider and provider.lower() == "anthropic":
                 os.environ["ANTHROPIC_API_KEY"] = self.api_key
@@ -72,7 +78,7 @@ class MCPClient:
         self.exit_stack = AsyncExitStack()
         self.sessions: Dict[str, ClientSession] = {}
         self.server_tools: Dict[str, List[Tool]] = {}
-        
+
         # Map fully-qualified tool names to (server_name, tool_name) tuples
         self.tool_map: Dict[str, Tuple[str, str]] = {}
 
@@ -91,18 +97,20 @@ class MCPClient:
         env = server_config.get("env")
 
         if not command:
-            raise ValueError(f"Invalid server configuration for '{server_name}': missing 'command'")
+            raise ValueError(
+                f"Invalid server configuration for '{server_name}': missing 'command'"
+            )
 
-        server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=env
+        server_params = StdioServerParameters(command=command, args=args, env=env)
+
+        stdio_transport = await self.exit_stack.enter_async_context(
+            stdio_client(server_params)
         )
-
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
         stdio, write_stream = stdio_transport
 
-        session = await self.exit_stack.enter_async_context(ClientSession(stdio, write_stream))
+        session = await self.exit_stack.enter_async_context(
+            ClientSession(stdio, write_stream)
+        )
         await session.initialize()
 
         # Store session
@@ -112,7 +120,9 @@ class MCPClient:
         response = await session.list_tools()
         self.server_tools[server_name] = response.tools
 
-        logger.info(f"Connected to server '{server_name}' with {len(response.tools)} tools")
+        logger.info(
+            f"Connected to server '{server_name}' with {len(response.tools)} tools"
+        )
 
     async def connect_to_all_servers(self) -> None:
         """Connect to all configured MCP servers."""
@@ -130,29 +140,36 @@ class MCPClient:
 
         for server_name, server_tools in self.server_tools.items():
             # Normalize server name for tool naming (replace hyphens with underscores)
-            normalized_server = server_name.replace('-', '_')
-            
+            normalized_server = server_name.replace("-", "_")
+
             for tool in server_tools:
                 # Create a consistent tool name with clear separator
-                fq_tool_name = f"{normalized_server}{self.TOOL_NAME_SEPARATOR}{tool.name}"
-                
+                fq_tool_name = (
+                    f"{normalized_server}{self.TOOL_NAME_SEPARATOR}{tool.name}"
+                )
+
                 # Store the mapping from full qualified name to (server_name, tool_name)
                 self.tool_map[fq_tool_name] = (server_name, tool.name)
-                
+
                 # Format tool for LiteLLM (follows OpenAI's format)
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": fq_tool_name,
-                        "description": tool.description or f"Tool from {server_name}",
-                        "parameters": tool.inputSchema
+                tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": fq_tool_name,
+                            "description": tool.description
+                            or f"Tool from {server_name}",
+                            "parameters": tool.inputSchema,
+                        },
                     }
-                })
+                )
 
         logger.debug(f"Registered tools: {self.tool_map}")
         return tools
 
-    async def call_tool(self, full_tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    async def call_tool(
+        self, full_tool_name: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Call a specific tool on an MCP server.
 
         Args:
@@ -164,7 +181,7 @@ class MCPClient:
         """
         logger.debug(f"Calling tool: {full_tool_name} with args: {arguments}")
         logger.debug(f"Available tool map: {self.tool_map}")
-        
+
         if full_tool_name in self.tool_map:
             # Use the mapping we created in get_available_tools
             server_name, tool_name = self.tool_map[full_tool_name]
@@ -174,17 +191,23 @@ class MCPClient:
                 parts = full_tool_name.split(self.TOOL_NAME_SEPARATOR, 1)
                 if len(parts) != 2:
                     raise ValueError(f"Invalid tool name format: {full_tool_name}")
-                
+
                 normalized_server, tool_name = parts
                 # Convert back normalized server name to actual server name
-                server_name = normalized_server.replace('_', '-')
-                
-                logger.warning(f"Tool {full_tool_name} not in tool map, parsed as server:{server_name}, tool:{tool_name}")
+                server_name = normalized_server.replace("_", "-")
+
+                logger.warning(
+                    f"Tool {full_tool_name} not in tool map, parsed as server:{server_name}, tool:{tool_name}"
+                )
             except ValueError:
-                raise ValueError(f"Invalid tool name format: {full_tool_name}. Expected 'server_name{self.TOOL_NAME_SEPARATOR}tool_name'")
+                raise ValueError(
+                    f"Invalid tool name format: {full_tool_name}. Expected 'server_name{self.TOOL_NAME_SEPARATOR}tool_name'"
+                )
 
         if server_name not in self.sessions:
-            raise ValueError(f"Server '{server_name}' not connected. Available servers: {list(self.sessions.keys())}")
+            raise ValueError(
+                f"Server '{server_name}' not connected. Available servers: {list(self.sessions.keys())}"
+            )
 
         session = self.sessions[server_name]
         logger.debug(f"Executing {tool_name} on server {server_name}")
@@ -199,7 +222,7 @@ class MCPClient:
             for content in result.content:
                 if hasattr(content, "text") and content.text:
                     text_chunks.append(content.text)
-            
+
             if text_chunks:
                 output["text"] = "\n".join(text_chunks)
 
@@ -209,87 +232,93 @@ class MCPClient:
         return output
 
     async def handle_tool_call(
-        self, 
-        tool_name: str, 
-        tool_id: str, 
-        tool_args: str, 
-        messages: List[Dict[str, Any]]
+        self,
+        tool_name: str,
+        tool_id: str,
+        tool_args: str,
+        messages: List[Dict[str, Any]],
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """Handle a tool call, execute it and prepare messages for further processing.
-        
+
         Args:
             tool_name: Name of the tool to call
             tool_id: ID of the tool call
             tool_args: String JSON arguments for the tool
             messages: Current message history
-            
+
         Returns:
             Tuple of (result_text, updated_messages)
         """
         try:
             tool_args_dict = json.loads(tool_args)
             tool_result = await self.call_tool(tool_name, tool_args_dict)
-            
+
             result_text = tool_result.get("text", "Tool executed successfully")
             if tool_result.get("error"):
                 result_text = f"Error executing tool: {result_text}"
-            
+
             # Add the tool call to messages
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": tool_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": tool_args
-                    }
-                }]
-            })
-            
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": tool_args},
+                        }
+                    ],
+                }
+            )
+
             # Add the tool result to messages
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "name": tool_name,
-                "content": result_text
-            })
-            
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": tool_name,
+                    "content": result_text,
+                }
+            )
+
             return result_text, messages
         except Exception as ex:
             logger.exception(f"Error calling tool: {ex}")
             error_message = f"Error executing tool {tool_name}: {str(ex)}"
-            
+
             # Even with an error, we still need to update the messages
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": tool_id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": tool_args
-                    }
-                }]
-            })
-            
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_id,
-                "name": tool_name,
-                "content": error_message
-            })
-            
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {"name": tool_name, "arguments": tool_args},
+                        }
+                    ],
+                }
+            )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_id,
+                    "name": tool_name,
+                    "content": error_message,
+                }
+            )
+
             return error_message, messages
-    
+
     async def process_query(
         self,
         query: str,
         system_prompt: str = "You are a helpful assistant.",
         temperature: float = 0.7,
-        stream: bool = True
+        stream: bool = True,
     ) -> AsyncGenerator[str, None]:
         """Process a query using LiteLLM and available tools.
 
@@ -307,18 +336,22 @@ class MCPClient:
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": query}
+            {"role": "user", "content": query},
         ]
-        
+
         # Initial call to get model response or tool call
         try:
             if stream:
-                async for chunk in self._process_streaming_query(messages, all_tools, temperature):
+                async for chunk in self._process_streaming_query(
+                    messages, all_tools, temperature
+                ):
                     yield chunk
             else:
-                async for chunk in self._process_non_streaming_query(messages, all_tools, temperature):
+                async for chunk in self._process_non_streaming_query(
+                    messages, all_tools, temperature
+                ):
                     yield chunk
-                
+
         except Exception as ex:
             logger.exception(f"Error in process_query: {ex}")
             yield f"\n[Error: {str(ex)}]\n"
@@ -327,23 +360,22 @@ class MCPClient:
         self,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
-        temperature: float
+        temperature: float,
     ) -> AsyncGenerator[str, None]:
         """Process a query in streaming mode.
-        
+
         Args:
             messages: List of messages to send to the model
             tools: List of available tools
             temperature: Temperature for model generation
-            
+
         Yields:
             Generated text chunks as they become available
         """
         current_tool_call = None
-        current_tool_args = ""
         current_message_text = ""
         tool_call_complete = False
-        
+
         # Start streaming response
         response_stream = await litellm.acompletion(
             model=self.model,
@@ -355,66 +387,72 @@ class MCPClient:
             stream=True,
             api_base=self.base_url,
         )
-        
+
         async for chunk in response_stream:
             # Check for tool calls
-            if hasattr(chunk, 'tool_calls') and chunk.tool_calls:
+            """
+            ModelResponseStream(id='chatcmpl-9a3d8a0a-b098-47e3-82c1-73a30d880d3d', created=1742916456,
+                    model='qwen2.5:32b', object='chat....ave_web_search'), type='function', index=0)], audio=None),
+                    logprobs=None)],
+                    provider_specific_fields=None, stream_options=None)
+            """
+
+            if (
+                chunk.choices[0].finish_reason == "tool_calls"
+                or hasattr(chunk, "tool_calls")
+                and chunk.tool_calls
+            ):
                 # Get the current tool call
-                for tool_call in chunk.tool_calls:
+                # chunk.choices[0].delta.tool_calls
+                for tool_call in chunk.choices[0].delta.tool_calls:
                     if not current_tool_call:
                         current_tool_call = {
                             "id": tool_call.id,
                             "name": tool_call.function.name,
-                            "arguments": ""
+                            "arguments": tool_call.function.arguments,
                         }
-                    
-                    # Append the argument json chunk
-                    if hasattr(tool_call.function, 'arguments'):
-                        current_tool_args += tool_call.function.arguments
-                    
-                    # Attempt to parse complete JSON when we have a closing brace
-                    if current_tool_args and '}' in current_tool_args and not tool_call_complete:
-                        try:
-                            # Check if we have complete, valid JSON
-                            json.loads(current_tool_args)
-                            tool_call_complete = True
-                            
-                            # We have a complete tool call, process it
-                            yield f"\n[Calling tool: {current_tool_call['name']}]\n"
-                            
-                            # Call the tool and handle the result
-                            result_text, updated_messages = await self.handle_tool_call(
-                                current_tool_call['name'],
-                                current_tool_call['id'],
-                                current_tool_args,
-                                messages
-                            )
-                            
-                            yield f"\n[Tool result: {result_text}]\n"
-                            
-                            # Continue the conversation with the tool result
-                            final_response = await litellm.acompletion(
-                                model=self.model,
-                                messages=updated_messages,
-                                max_tokens=self.max_tokens,
-                                temperature=temperature,
-                                stream=True,
-                                api_base=self.base_url,
-                            )
-                            
-                            # Stream the final response
-                            async for final_chunk in final_response:
-                                delta = final_chunk.choices[0].delta
-                                if hasattr(delta, 'content') and delta.content:
-                                    yield delta.content
-                                    
-                        except json.JSONDecodeError:
-                            # Not complete JSON yet, continue collecting
-                            pass
-            
+
+                    try:
+                        # Check if we have complete, valid JSON
+                        json.loads(current_tool_call["arguments"])
+                        tool_call_complete = True
+
+                        # We have a complete tool call, process it
+                        yield f"\n[Calling tool: {current_tool_call['name']}]\n"
+
+                        # Call the tool and handle the result
+                        result_text, updated_messages = await self.handle_tool_call(
+                            current_tool_call["name"],
+                            current_tool_call["id"],
+                            current_tool_call["arguments"],
+                            messages,
+                        )
+
+                        yield f"\n[Tool result: {result_text}]\n"
+
+                        # Continue the conversation with the tool result
+                        final_response = await litellm.acompletion(
+                            model=self.model,
+                            messages=updated_messages,
+                            max_tokens=self.max_tokens,
+                            temperature=temperature,
+                            stream=True,
+                            api_base=self.base_url,
+                        )
+
+                        # Stream the final response
+                        async for final_chunk in final_response:
+                            delta = final_chunk.choices[0].delta
+                            if hasattr(delta, "content") and delta.content:
+                                yield delta.content
+
+                    except json.JSONDecodeError:
+                        # Not complete JSON yet, continue collecting
+                        pass
+
             # Handle regular text content
             delta = chunk.choices[0].delta
-            if hasattr(delta, 'content') and delta.content and not tool_call_complete:
+            if hasattr(delta, "content") and delta.content and not tool_call_complete:
                 current_message_text += delta.content
                 yield delta.content
 
@@ -422,15 +460,15 @@ class MCPClient:
         self,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
-        temperature: float
+        temperature: float,
     ) -> AsyncGenerator[str, None]:
         """Process a query in non-streaming mode.
-        
+
         Args:
             messages: List of messages to send to the model
             tools: List of available tools
             temperature: Temperature for model generation
-            
+
         Yields:
             Generated text chunks
         """
@@ -445,25 +483,22 @@ class MCPClient:
             stream=False,
             api_base=self.base_url,
         )
-        
-        if hasattr(response, 'tool_calls') and response.tool_calls:
+
+        if hasattr(response, "tool_calls") and response.tool_calls:
             # Process tool calls
             for tool_call in response.tool_calls:
                 tool_name = tool_call.function.name
                 tool_args_str = tool_call.function.arguments
-                
+
                 yield f"\n[Calling tool: {tool_name}]\n"
-                
+
                 # Call the tool and handle the result
                 result_text, updated_messages = await self.handle_tool_call(
-                    tool_name,
-                    tool_call.id,
-                    tool_args_str,
-                    messages
+                    tool_name, tool_call.id, tool_args_str, messages
                 )
-                
+
                 yield f"\n[Tool result: {result_text}]\n"
-                
+
                 # Continue the conversation with the tool result
                 final_response = await litellm.acompletion(
                     model=self.model,
@@ -473,18 +508,22 @@ class MCPClient:
                     stream=False,
                     api_base=self.base_url,
                 )
-                
-                if hasattr(final_response.choices[0], 'message') and hasattr(final_response.choices[0].message, 'content'):
+
+                if hasattr(final_response.choices[0], "message") and hasattr(
+                    final_response.choices[0].message, "content"
+                ):
                     yield final_response.choices[0].message.content
         else:
             # No tool calls, just return the response
-            if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
+            if hasattr(response.choices[0], "message") and hasattr(
+                response.choices[0].message, "content"
+            ):
                 yield response.choices[0].message.content
 
     async def close(self):
         """Alias for cleanup() for compatibility."""
         await self.cleanup()
-        
+
     async def aclose(self):
         """Alias for cleanup() for compatibility."""
         await self.cleanup()

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """MCP-LLM Command-Line Interface.
 
-This module provides a command-line interface for interacting with 
+This module provides a command-line interface for interacting with
 Large Language Models through the MCP (Model Control Protocol) interface.
 """
 
 import sys
-import os
 import typer
 import asyncio
 from loguru import logger
@@ -28,24 +27,25 @@ console = Console()
 # Create Typer app
 app = typer.Typer(
     name="mcp-llm",
-    help="MCP Client CLI for interacting with Large Language Models and MCP servers"
+    help="MCP Client CLI for interacting with Large Language Models and MCP servers",
 )
+
 
 def load_environment():
     """Load environment variables from multiple sources."""
     # Try standard .env file
     load_dotenv()
-    
+
     # Try .env.local if it exists
     env_local = Path(".env.local")
     if env_local.exists():
         load_dotenv(env_local)
-    
+
     # Try .env in /data if we're in a container environment
     data_env = Path("/data/.env")
     if data_env.exists():
         load_dotenv(data_env)
-    
+
     # Try /data/.env.local if it exists
     data_env_local = Path("/data/.env.local")
     if data_env_local.exists():
@@ -54,7 +54,7 @@ def load_environment():
 
 class ClientManager:
     """Manage LLM client lifecycle with proper error handling."""
-    
+
     def __init__(
         self,
         client_type: str = "litellm",
@@ -62,10 +62,10 @@ class ClientManager:
         api_key: Optional[str] = None,
         model: str = "ollama/qwen2.5:32b",
         max_tokens: int = 4096,
-        base_url: Optional[str] = None
+        base_url: Optional[str] = None,
     ):
         """Initialize client manager.
-        
+
         Args:
             client_type: Type of client to use ("litellm" or "anthropic")
             config: Path to config file
@@ -81,7 +81,7 @@ class ClientManager:
         self.max_tokens = max_tokens
         self.base_url = base_url
         self.client: Union[LiteLLMClient, AnthropicClient, Any] = None
-        
+
         # Initialize client immediately
         if self.client_type == "litellm":
             self.client = LiteLLMClient(
@@ -89,49 +89,44 @@ class ClientManager:
                 api_key=self.api_key,
                 model=self.model,
                 max_tokens=self.max_tokens,
-                base_url=self.base_url
+                base_url=self.base_url,
             )
         elif self.client_type == "anthropic":
             self.client = AnthropicClient(
                 config_path=self.config,
                 anthropic_api_key=self.api_key,
                 model=self.model,
-                max_tokens=self.max_tokens
+                max_tokens=self.max_tokens,
             )
         else:
             raise ValueError(f"Unknown client type: {self.client_type}")
-        
+
     async def connect_to_servers(self, server_names: Optional[List[str]] = None):
         """Connect to specified servers or all available servers."""
         if not self.client:
             raise ValueError("Client not initialized")
-            
+
         if server_names:
             for server_name in server_names:
                 try:
                     await self.client.connect_to_server(server_name)
                 except Exception as e:
-                    console.print(f"[bold red]Error connecting to {server_name}:[/] {str(e)}")
+                    console.print(
+                        f"[bold red]Error connecting to {server_name}:[/] {str(e)}"
+                    )
         else:
             await self.client.connect_to_all_servers()
-            
-    async def process_query(
-        self,
-        query: str,
-        system_prompt: str,
-        temperature: float
-    ):
+
+    async def process_query(self, query: str, system_prompt: str, temperature: float):
         """Process a query and yield the results."""
         if not self.client:
             raise ValueError("Client not initialized")
-            
+
         async for chunk in self.client.process_query(
-            query=query,
-            system_prompt=system_prompt,
-            temperature=temperature
+            query=query, system_prompt=system_prompt, temperature=temperature
         ):
             yield chunk
-            
+
     async def cleanup(self):
         """Clean up resources."""
         if self.client:
@@ -140,7 +135,7 @@ class ClientManager:
 
 async def stream_to_console(console, query_generator):
     """Stream response chunks to the console with proper formatting.
-    
+
     Args:
         console: Rich console instance to print to
         query_generator: Async generator producing response chunks
@@ -197,37 +192,46 @@ def chat(
                 api_key=api_key,
                 model=model,
                 max_tokens=max_tokens,
-                base_url=base_url
+                base_url=base_url,
             )
-            
+
             try:
                 # Connect to servers
                 await client_manager.connect_to_servers(servers)
-                
+
                 # Get available tools
                 tools = client_manager.client.get_available_tools()
                 if not tools:
-                    console.print("[yellow]Warning:[/] No tools available from connected servers.")
+                    console.print(
+                        "[yellow]Warning:[/] No tools available from connected servers."
+                    )
                 else:
-                    console.print(f"[green]Connected to {len(client_manager.client.sessions)} servers with {len(tools)} tools available.[/]")
+                    console.print(
+                        f"[green]Connected to {len(client_manager.client.sessions)} servers with {len(tools)} tools available.[/]"
+                    )
 
                 # Single query mode
                 if query:
                     console.print(f"[bold]Query:[/] {query}")
                     console.print("[bold]Response:[/]")
-                    
-                    await stream_to_console(console, client_manager.process_query(
-                        query=query,
-                        system_prompt=system_prompt,
-                        temperature=temperature
-                    ))
+
+                    await stream_to_console(
+                        console,
+                        client_manager.process_query(
+                            query=query,
+                            system_prompt=system_prompt,
+                            temperature=temperature,
+                        ),
+                    )
 
                     await client_manager.cleanup()
                     return
 
                 # Interactive mode
                 console.print("[bold green]MCP Client[/]")
-                console.print("Type your queries below. Use [bold]exit[/], [bold]quit[/], or [bold]Ctrl+C[/] to exit.")
+                console.print(
+                    "Type your queries below. Use [bold]exit[/], [bold]quit[/], or [bold]Ctrl+C[/] to exit."
+                )
                 console.print("=========================================")
 
                 while True:
@@ -243,11 +247,14 @@ def chat(
                         # Display assistant response
                         console.print("\n[bold purple]Assistant:[/] ", end="")
                         console.flush()
-                        await stream_to_console(console, client_manager.process_query(
-                            query=user_input,
-                            system_prompt=system_prompt,
-                            temperature=temperature
-                        ))
+                        await stream_to_console(
+                            console,
+                            client_manager.process_query(
+                                query=user_input,
+                                system_prompt=system_prompt,
+                                temperature=temperature,
+                            ),
+                        )
 
                     except KeyboardInterrupt:
                         console.print("\n[yellow]Interrupted by user[/]")
@@ -256,11 +263,11 @@ def chat(
                         console.print(f"\n[bold red]Error:[/] {str(e)}")
 
                 console.print("[bold green]Session ended[/]")
-                
+
             finally:
                 # Always ensure cleanup
                 await client_manager.cleanup()
-                
+
         except ValueError as e:
             console.print(f"[bold red]Error in configuration:[/] {str(e)}")
             sys.exit(1)
@@ -285,7 +292,7 @@ def servers(
     """List configured MCP servers."""
     # Load environment variables
     load_environment()
-    
+
     try:
         # Initialize config manager
         config_manager = MCPConfig(config)
@@ -315,6 +322,6 @@ if __name__ == "__main__":
         format="{message}",
         level="INFO",
     )
-    
+
     # Run the app
     app()
