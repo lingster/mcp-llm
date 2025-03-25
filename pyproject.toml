@@ -23,6 +23,7 @@ dependencies = [
     "litellm>=1.63.14",
     "loguru>=0.7.3",
     "mcp>=0.0.17",
+    "mypy>=1.15.0",
     "python-dotenv>=1.0.0",
     "rich>=13.7.0",
     "typer>=0.9.0",
@@ -36,6 +37,9 @@ packages = ["mcp_llm"]
 
 [tool.uv.sources]
 mcp-llm = { workspace = true }
+
+[tool.uv.workspace]
+members = ["mcp-client"]
 
 [dependency-groups]
 dev = [
