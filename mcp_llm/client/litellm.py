@@ -4,7 +4,7 @@ import sys
 import json
 from loguru import logger
 from contextlib import AsyncExitStack
-from typing import Any, Dict, List, Optional, AsyncGenerator, Tuple
+from typing import Any, Dict, List, Optional, AsyncGenerator, Tuple, Union, cast
 
 import litellm
 from litellm.utils import StreamingChoices
@@ -30,7 +30,7 @@ class MCPClient:
         api_key: Optional[str] = None,
         model: str = "anthropic/claude-3-7-sonnet-20241024",
         max_tokens: int = 4096,
-        base_url: str | None = None
+        base_url: Optional[str] = None
     ):
         """Initialize the MCP client.
 
@@ -44,16 +44,13 @@ class MCPClient:
         self.config = MCPConfig(config_path)
         self.model = model
         self.max_tokens = max_tokens
+        self.base_url = base_url
         
-       
-        # 
+        # Set API key based on model provider
         if base_url:
-            self.base_url = base_url
             litellm.api_base = base_url
-            #if '/' in model:
-                #self.model = model.split('/')[-1]
         else:
-            # Set API key based on provider or use passed key
+            # Extract provider from model string
             provider = model.split('/')[0] if '/' in model else None
             env_var_name = f"{provider.upper()}_API_KEY" if provider else "LITELLM_API_KEY"
             
@@ -62,7 +59,7 @@ class MCPClient:
             if not self.api_key:
                 raise ValueError(f"API key is required. Set {env_var_name} env var or pass it to the constructor.")
             
-            # Configure LiteLLM
+            # Configure LiteLLM with the appropriate API key
             if provider and provider.lower() == "anthropic":
                 os.environ["ANTHROPIC_API_KEY"] = self.api_key
             elif provider and provider.lower() == "openai":
@@ -194,22 +191,98 @@ class MCPClient:
         result = await session.call_tool(tool_name, arguments)
 
         # Convert MCP result to a dictionary for easier processing
-        output = {}
+        output: Dict[str, Any] = {}
 
         if hasattr(result, "content") and result.content:
-            # Handle text content
-            texts = [c.text for c in result.content if hasattr(c, "text") and c.text]
-            if texts:
-                output["text"] = "\n".join(texts)
-
-            # TODO: Handle other types of content if needed, eg images, files, etc.
-            # ...
+            # Handle text content by checking each content item
+            text_chunks = []
+            for content in result.content:
+                if hasattr(content, "text") and content.text:
+                    text_chunks.append(content.text)
+            
+            if text_chunks:
+                output["text"] = "\n".join(text_chunks)
 
         if hasattr(result, "isError") and result.isError:
             output["error"] = True
 
         return output
 
+    async def handle_tool_call(
+        self, 
+        tool_name: str, 
+        tool_id: str, 
+        tool_args: str, 
+        messages: List[Dict[str, Any]]
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Handle a tool call, execute it and prepare messages for further processing.
+        
+        Args:
+            tool_name: Name of the tool to call
+            tool_id: ID of the tool call
+            tool_args: String JSON arguments for the tool
+            messages: Current message history
+            
+        Returns:
+            Tuple of (result_text, updated_messages)
+        """
+        try:
+            tool_args_dict = json.loads(tool_args)
+            tool_result = await self.call_tool(tool_name, tool_args_dict)
+            
+            result_text = tool_result.get("text", "Tool executed successfully")
+            if tool_result.get("error"):
+                result_text = f"Error executing tool: {result_text}"
+            
+            # Add the tool call to messages
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": tool_args
+                    }
+                }]
+            })
+            
+            # Add the tool result to messages
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "name": tool_name,
+                "content": result_text
+            })
+            
+            return result_text, messages
+        except Exception as ex:
+            logger.exception(f"Error calling tool: {ex}")
+            error_message = f"Error executing tool {tool_name}: {str(ex)}"
+            
+            # Even with an error, we still need to update the messages
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": tool_args
+                    }
+                }]
+            })
+            
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "name": tool_name,
+                "content": error_message
+            })
+            
+            return error_message, messages
     
     async def process_query(
         self,
@@ -240,188 +313,181 @@ class MCPClient:
         # Initial call to get model response or tool call
         try:
             if stream:
-                current_tool_call = None
-                current_tool_args = ""
-                current_message_text = ""
-                tool_call_complete = False
-                
-                # Start streaming response
-                response_stream = await litellm.acompletion(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=self.max_tokens,
-                    temperature=temperature,
-                    tools=all_tools,
-                    tool_choice="auto",
-                    stream=True,
-                    api_base=self.base_url,
-                )
-                
-                async for chunk in response_stream:
-                    # Check for tool calls
-                    if hasattr(chunk, 'tool_calls') and chunk.tool_calls:
-                        # Get the current tool call
-                        for tool_call in chunk.tool_calls:
-                            if not current_tool_call:
-                                current_tool_call = {
-                                    "id": tool_call.id,
-                                    "name": tool_call.function.name,
-                                    "arguments": ""
-                                }
-                            
-                            # Append the argument json chunk
-                            if hasattr(tool_call.function, 'arguments'):
-                                current_tool_args += tool_call.function.arguments
-                            
-                            # Attempt to parse complete JSON when we have a closing brace
-                            if current_tool_args and '}' in current_tool_args and not tool_call_complete:
-                                try:
-                                    # Check if we have complete, valid JSON
-                                    json.loads(current_tool_args)
-                                    tool_call_complete = True
-                                    
-                                    # We have a complete tool call, process it
-                                    yield f"\n[Calling tool: {current_tool_call['name']}]\n"
-                                    
-                                    # Extract arguments
-                                    tool_args_dict = json.loads(current_tool_args)
-                                    
-                                    # Call the tool
-                                    tool_result = await self.call_tool(current_tool_call['name'], tool_args_dict)
-                                    result_text = tool_result.get("text", "Tool executed successfully")
-                                    
-                                    if tool_result.get("error"):
-                                        result_text = f"Error with tool_result: {result_text}/{tool_result.get('error')}"
-                                    
-                                    # Add the tool call and result to messages
-                                    messages.append({
-                                        "role": "assistant", 
-                                        "content": None,
-                                        "tool_calls": [{
-                                            "id": current_tool_call['id'],
-                                            "type": "function",
-                                            "function": {
-                                                "name": current_tool_call['name'],
-                                                "arguments": current_tool_args
-                                            }
-                                        }]
-                                    })
-                                    
-                                    messages.append({
-                                        "role": "tool",
-                                        "tool_call_id": current_tool_call['id'],
-                                        "name": current_tool_call['name'],
-                                        "content": result_text
-                                    })
-                                    
-                                    yield f"\n[Tool result: {result_text}]\n"
-                                    
-                                    # Continue the conversation with the tool result
-                                    final_response = await litellm.acompletion(
-                                        model=self.model,
-                                        messages=messages,
-                                        max_tokens=self.max_tokens,
-                                        temperature=temperature,
-                                        stream=True,
-                                        api_base=self.base_url,
-                                    )
-                                    
-                                    # Stream the final response
-                                    async for final_chunk in final_response:
-                                        delta = final_chunk.choices[0].delta
-                                        if hasattr(delta, 'content') and delta.content:
-                                            yield delta.content
-                                        
-                                except json.JSONDecodeError:
-                                    # Not complete JSON yet, continue collecting
-                                    pass
-                    
-                    # Handle regular text content
-                    delta = chunk.choices[0].delta
-                    if hasattr(delta, 'content') and delta.content and not tool_call_complete:
-                        current_message_text += delta.content
-                        yield delta.content
-                
-                # If we finished streaming without a tool call
-                if not tool_call_complete and current_message_text:
-                    # Nothing more to do, already yielded the content
-                    pass
-                        
+                async for chunk in self._process_streaming_query(messages, all_tools, temperature):
+                    yield chunk
             else:
-                # Non-streaming mode
-                response = await litellm.acompletion(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=self.max_tokens,
-                    temperature=temperature,
-                    tools=all_tools,
-                    tool_choice="auto",
-                    stream=False,
-                    api_base=self.base_url,
-                )
+                async for chunk in self._process_non_streaming_query(messages, all_tools, temperature):
+                    yield chunk
                 
-                if hasattr(response, 'tool_calls') and response.tool_calls:
-                    # Process tool calls
-                    for tool_call in response.tool_calls:
-                        tool_name = tool_call.function.name
-                        tool_args_str = tool_call.function.arguments
-                        
-                        yield f"\n[Calling tool: {tool_name}]\n"
-                        
+        except Exception as ex:
+            logger.exception(f"Error in process_query: {ex}")
+            yield f"\n[Error: {str(ex)}]\n"
+
+    async def _process_streaming_query(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float
+    ) -> AsyncGenerator[str, None]:
+        """Process a query in streaming mode.
+        
+        Args:
+            messages: List of messages to send to the model
+            tools: List of available tools
+            temperature: Temperature for model generation
+            
+        Yields:
+            Generated text chunks as they become available
+        """
+        current_tool_call = None
+        current_tool_args = ""
+        current_message_text = ""
+        tool_call_complete = False
+        
+        # Start streaming response
+        response_stream = await litellm.acompletion(
+            model=self.model,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            temperature=temperature,
+            tools=tools,
+            tool_choice="auto",
+            stream=True,
+            api_base=self.base_url,
+        )
+        
+        async for chunk in response_stream:
+            # Check for tool calls
+            if hasattr(chunk, 'tool_calls') and chunk.tool_calls:
+                # Get the current tool call
+                for tool_call in chunk.tool_calls:
+                    if not current_tool_call:
+                        current_tool_call = {
+                            "id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "arguments": ""
+                        }
+                    
+                    # Append the argument json chunk
+                    if hasattr(tool_call.function, 'arguments'):
+                        current_tool_args += tool_call.function.arguments
+                    
+                    # Attempt to parse complete JSON when we have a closing brace
+                    if current_tool_args and '}' in current_tool_args and not tool_call_complete:
                         try:
-                            tool_args_dict = json.loads(tool_args_str)
-                            tool_result = await self.call_tool(tool_name, tool_args_dict)
-                            result_text = tool_result.get("text", "Tool executed successfully")
+                            # Check if we have complete, valid JSON
+                            json.loads(current_tool_args)
+                            tool_call_complete = True
                             
-                            if tool_result.get("error"):
-                                result_text = f"Error: {result_text}"
+                            # We have a complete tool call, process it
+                            yield f"\n[Calling tool: {current_tool_call['name']}]\n"
                             
-                            # Add the tool call and result to messages
-                            messages.append({
-                                "role": "assistant", 
-                                "content": None,
-                                "tool_calls": [{
-                                    "id": tool_call.id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": tool_name,
-                                        "arguments": tool_args_str
-                                    }
-                                }]
-                            })
-                            
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_name,
-                                "content": result_text
-                            })
+                            # Call the tool and handle the result
+                            result_text, updated_messages = await self.handle_tool_call(
+                                current_tool_call['name'],
+                                current_tool_call['id'],
+                                current_tool_args,
+                                messages
+                            )
                             
                             yield f"\n[Tool result: {result_text}]\n"
                             
                             # Continue the conversation with the tool result
                             final_response = await litellm.acompletion(
                                 model=self.model,
-                                messages=messages,
+                                messages=updated_messages,
                                 max_tokens=self.max_tokens,
                                 temperature=temperature,
-                                stream=False,
+                                stream=True,
                                 api_base=self.base_url,
                             )
                             
-                            yield final_response.choices[0].message.content
-                            
-                        except Exception as ex:
-                            logger.exception(f"Error calling tool: {ex}")
-                            yield f"\n[Error executing tool {tool_name}: {str(ex)}]\n"
-                    
-                else:
-                    # No tool calls, just return the response
-                    yield response.choices[0].message.content
-                    
-        except Exception as ex:
-            logger.exception(f"Error in process_query: {ex}")
-            yield f"\n[Error: {str(ex)}]\n"
+                            # Stream the final response
+                            async for final_chunk in final_response:
+                                delta = final_chunk.choices[0].delta
+                                if hasattr(delta, 'content') and delta.content:
+                                    yield delta.content
+                                    
+                        except json.JSONDecodeError:
+                            # Not complete JSON yet, continue collecting
+                            pass
+            
+            # Handle regular text content
+            delta = chunk.choices[0].delta
+            if hasattr(delta, 'content') and delta.content and not tool_call_complete:
+                current_message_text += delta.content
+                yield delta.content
+
+    async def _process_non_streaming_query(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float
+    ) -> AsyncGenerator[str, None]:
+        """Process a query in non-streaming mode.
+        
+        Args:
+            messages: List of messages to send to the model
+            tools: List of available tools
+            temperature: Temperature for model generation
+            
+        Yields:
+            Generated text chunks
+        """
+        # Non-streaming mode
+        response = await litellm.acompletion(
+            model=self.model,
+            messages=messages,
+            max_tokens=self.max_tokens,
+            temperature=temperature,
+            tools=tools,
+            tool_choice="auto",
+            stream=False,
+            api_base=self.base_url,
+        )
+        
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            # Process tool calls
+            for tool_call in response.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args_str = tool_call.function.arguments
+                
+                yield f"\n[Calling tool: {tool_name}]\n"
+                
+                # Call the tool and handle the result
+                result_text, updated_messages = await self.handle_tool_call(
+                    tool_name,
+                    tool_call.id,
+                    tool_args_str,
+                    messages
+                )
+                
+                yield f"\n[Tool result: {result_text}]\n"
+                
+                # Continue the conversation with the tool result
+                final_response = await litellm.acompletion(
+                    model=self.model,
+                    messages=updated_messages,
+                    max_tokens=self.max_tokens,
+                    temperature=temperature,
+                    stream=False,
+                    api_base=self.base_url,
+                )
+                
+                if hasattr(final_response.choices[0], 'message') and hasattr(final_response.choices[0].message, 'content'):
+                    yield final_response.choices[0].message.content
+        else:
+            # No tool calls, just return the response
+            if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
+                yield response.choices[0].message.content
+
+    async def close(self):
+        """Alias for cleanup() for compatibility."""
+        await self.cleanup()
+        
+    async def aclose(self):
+        """Alias for cleanup() for compatibility."""
+        await self.cleanup()
 
     async def cleanup(self):
         """Clean up resources and connections."""

@@ -1,22 +1,73 @@
 from enum import Enum
 import os
 import sys
+import json
 from loguru import logger
 from contextlib import AsyncExitStack
-from typing import Any, Dict, List, Optional, AsyncGenerator, Tuple
+from typing import Any, Dict, List, Optional, AsyncGenerator, Tuple, Union, cast, Iterable, TypeVar, Protocol, runtime_checkable
 
 from anthropic import Anthropic, AsyncAnthropic
-from anthropic.types import (RawMessageStartEvent, RawContentBlockStartEvent, RawMessageStopEvent, RawMessageDeltaEvent,
-                             RawContentBlockStopEvent, RawContentBlockDeltaEvent)
-from anthropic.types import MessageParam, ToolUseBlock, TextBlock
+from anthropic.types import (
+    Message, MessageParam,
+    RawMessageStartEvent, RawContentBlockStartEvent, RawMessageStopEvent, 
+    RawMessageDeltaEvent, RawContentBlockStopEvent, RawContentBlockDeltaEvent,
+    MessageCreateParams
+)
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import Resource, Tool
 
-from .config import MCPConfig
+from ..config import MCPConfig
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
+
+
+# Define ToolParam since it's missing from anthropic.types
+class ToolParam(Dict[str, Any]):
+    """Tool parameter structure for Anthropic API."""
+    pass
+
+
+class EventType(str, Enum):
+    """Event types from Anthropic streaming API."""
+    MESSAGE_START = 'message_start'
+    CONTENT_BLOCK_START = 'content_block_start'
+    CONTENT_BLOCK_DELTA = 'content_block_delta'
+    CONTENT_BLOCK_STOP = 'content_block_stop'
+    PING = 'ping'
+    ERROR = 'error'
+    TOOL_USE = 'tool_use'
+    MESSAGE_DELTA = 'message_delta'
+    MESSAGE_STOP = 'message_stop'
+
+
+class ContentType(str, Enum):
+    """Content types from Anthropic API."""
+    TEXT = 'text'
+    TOOL_USE = 'tool_use'
+
+
+@runtime_checkable
+class ContentBlock(Protocol):
+    """Protocol for content blocks."""
+    type: str
+
+
+@runtime_checkable
+class TextContentBlock(ContentBlock, Protocol):
+    """Protocol for text content blocks."""
+    type: str
+    text: str
+
+
+@runtime_checkable
+class ToolUseContentBlock(ContentBlock, Protocol):
+    """Protocol for tool use content blocks."""
+    type: str
+    name: str
+    id: str
+    input: Dict[str, Any]
 
 
 class MCPClient:
@@ -170,16 +221,18 @@ class MCPClient:
         result = await session.call_tool(tool_name, arguments)
 
         # Convert MCP result to a dictionary for easier processing
-        output = {}
+        output: Dict[str, Any] = {}
 
         if hasattr(result, "content") and result.content:
-            # Handle text content
-            texts = [c.text for c in result.content if hasattr(c, "text") and c.text]
-            if texts:
-                output["text"] = "\n".join(texts)
-
-            # TODO: Handle other types of content if needed, eg images, files, etc.
-            # ...
+            # Handle text content by checking each content item
+            text_chunks = []
+            for content in result.content:
+                # Safe check for text attribute
+                if hasattr(content, "text") and content.text:
+                    text_chunks.append(content.text)
+            
+            if text_chunks:
+                output["text"] = "\n".join(text_chunks)
 
         if hasattr(result, "isError") and result.isError:
             output["error"] = True
@@ -213,100 +266,213 @@ class MCPClient:
                 "content": query
             }
         ]
-        return self._process_query(messages, system_prompt, temperature, stream, all_tools)
+        async for chunk in self._process_query(messages, system_prompt, temperature, stream, all_tools):
+            yield chunk
 
-    async def _process_query(self, messages: list, system_prompt: str, temperature: float = 0.7, stream: bool = True, all_tools: list = []) -> AsyncGenerator[str, None]:
-        class EventType(str, Enum):
-            MESSAGE_START = 'message_start'
-            CONTENT_BLOCK_START = 'content_block_start'
-            CONTENT_BLOCK_DELTA = 'content_block_delta'
-            CONTENT_BLOCK_STOP = 'content_block_stop'
-            PING = 'ping'
-            ERROR = 'error'
-            TOOL_USE = 'tool_use'
-            MESSAGE_DELTA = 'message_delta'
-            MESSAGE_STOP = 'message_stop'
-
-
-        class MessageType(str, Enum):
-            MESSAGE = 'message'
-            TOOL_USE = 'tool_use'
-
-        message_type: MessageType = None
+    async def _process_query(
+        self, 
+        messages: List[MessageParam], 
+        system_prompt: str, 
+        temperature: float = 0.7, 
+        stream: bool = True, 
+        all_tools: List[Dict[str, Any]] = []
+    ) -> AsyncGenerator[str, None]:
+        """Internal method to process queries with streaming support.
+        
+        Args:
+            messages: List of messages to send to Claude
+            system_prompt: System prompt for Claude
+            temperature: Temperature for model generation
+            stream: Whether to stream the response
+            all_tools: List of available tools
+            
+        Yields:
+            Generated text chunks as they become available
+        """
         message_text = ""
         tool_args = ""
         tool_name = None
         tool_id = None
-        message_usage = None
+        content_type = None
+
+        # Create kwargs to handle the API call safely for type checking
+        kwargs = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": temperature,
+            "system": system_prompt,
+            "messages": messages,
+            "stream": stream
+        }
+        
+        # Use this pattern to bypass type checking issues
+        # Only add tools if we have them
+        if all_tools:
+            kwargs["tools"] = [{
+                "name": tool["name"],
+                "description": tool["description"],
+                "input_schema": tool["input_schema"]
+            } for tool in all_tools]
+        
         # Start streaming response
-        response_generator = await self.async_anthropic.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            temperature=temperature,
-            system=system_prompt,
-            messages=messages,
-            tools=all_tools,
-            stream=stream
-        )
+        response = await self.async_anthropic.messages.create(**kwargs)
 
-        async for event in response_generator:
-            if event.type == 'input_json':
-                logger.debug(f"delta: {repr(event.partial_json)}")
-                logger.debug(f"snapshot: {event.snapshot}")
-            elif event.type=='message_start':
-                evt: RawMessageStartEvent = event
-                if evt.message.type == MessageType.MESSAGE:
-                    message_text = ""
-                elif evt.message.type == MessageType.TOOL_USE:
-                    tool_args = ""
-                else:
-                    logger.warning(f"unhandled message_start: {evt}")
-                message_usage = evt.message.usage
-
-            elif event.type=='content_block_start':
-                evt: RawContentBlockStartEvent = event
-                if evt.content_block.type == MessageType.MESSAGE:
-                    message_text = ""
-                elif evt.content_block.type == MessageType.TOOL_USE:
-                    tool_name = evt.content_block.name
-                    tool_id = evt.content_block.id
-
-            elif event.type=='content_block_stop':
-                evt: RawContentBlockStopEvent = event
-
-            elif event.type=='content_block_delta':
-                evt: RawContentBlockDeltaEvent = event
-                if evt.delta.type == 'text_delta':
-                    message_text += evt.delta.text
-                    yield evt.delta.text
-                elif evt.delta.type == 'input_json_delta':
-                    tool_args += evt.delta.partial_json
-                else:
-                    logger.warning(f"unhandled content_block_delta: {evt}")
-
-            elif event.type =='tool_use':
-                logger.debug(f"tool_use: {event.tool_use}")
-            elif event.type=='message':
-                logger.debug(f"message: {event.message}")
-            elif event.type=='message_stop':
-                logger.debug(f"message_stop: {event.type}")
-                continue
-            elif event.type == 'message_delta':
-                logger.debug(f"{event.delta.stop_reason} / {event.usage}")
+        if not stream:
+            # For non-streaming response, directly process the message content
+            if hasattr(response, "content"):
+                has_tool_call = False
+                
+                for content_block in response.content:
+                    if isinstance(content_block, dict) and "type" in content_block:
+                        # Handle different types of content blocks
+                        if content_block["type"] == "text":
+                            if "text" in content_block:
+                                yield content_block["text"]
+                        elif content_block["type"] == "tool_use":
+                            has_tool_call = True
+                            tool_name = content_block.get("name")
+                            tool_id = content_block.get("id")
+                            tool_args = json.dumps(content_block.get("input", {}))
+                    else:
+                        # Try direct attribute access if not a dict
+                        if hasattr(content_block, "type"):
+                            if content_block.type == "text" and hasattr(content_block, "text"):
+                                yield content_block.text
+                            elif content_block.type == "tool_use":
+                                has_tool_call = True
+                                if hasattr(content_block, "name"):
+                                    tool_name = content_block.name
+                                if hasattr(content_block, "id"):
+                                    tool_id = content_block.id
+                                if hasattr(content_block, "input"):
+                                    tool_args = json.dumps(content_block.input)
+                
+                if has_tool_call and tool_name and tool_id and tool_args:
+                    try:
+                        tool_args_dict = json.loads(tool_args)
+                        tool_result = await self.call_tool(tool_name, tool_args_dict)
+                        
+                        # Add tool result to messages
+                        messages.append({
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": tool_id, "name": tool_name, "input": tool_args_dict}
+                            ]
+                        })
+                        
+                        result_text = tool_result.get("text", "Tool executed successfully")
+                        if tool_result.get("error"):
+                            result_text = f"Error: {result_text}"
+                        
+                        messages.append({
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": tool_id, "content": result_text}
+                            ]
+                        })
+                        
+                        yield f"\n[Tool result: {result_text}]\n"
+                        
+                        # Continue the conversation with the tool result
+                        async for chunk in self._process_query(messages, system_prompt, temperature, stream, all_tools):
+                            yield chunk
+                    except Exception as ex:
+                        logger.exception(f"Error calling tool: {ex}")
+                        yield f"\n[Error executing tool {tool_name}: {str(ex)}]\n"
+            
+            return
+            
+        # Streaming response handling
+        try:
+            # Safe streaming using iterator
+            if hasattr(response, "__aiter__"):
+                async for event in response:
+                    if hasattr(event, "type"):
+                        event_type = event.type
+                        
+                        if event_type == 'input_json':
+                            # Safely handle input_json events
+                            if hasattr(event, 'partial_json'):
+                                logger.debug(f"delta: {repr(event.partial_json)}")
+                            if hasattr(event, 'snapshot'):
+                                logger.debug(f"snapshot: {event.snapshot}")
+                        
+                        elif event_type == 'message_start':
+                            # Message start event
+                            if hasattr(event, "message") and hasattr(event.message, "type"):
+                                if event.message.type == 'message':
+                                    message_text = ""
+                                    content_type = ContentType.TEXT
+                                elif event.message.type == 'tool_use':
+                                    tool_args = ""
+                                    content_type = ContentType.TOOL_USE
+                                else:
+                                    logger.warning(f"Unhandled message_start type: {event.message.type}")
+                        
+                        elif event_type == 'content_block_start':
+                            # Content block start event
+                            if hasattr(event, "content_block") and hasattr(event.content_block, "type"):
+                                if event.content_block.type == 'text':
+                                    message_text = ""
+                                elif event.content_block.type == 'tool_use':
+                                    if hasattr(event.content_block, "name"):
+                                        tool_name = event.content_block.name
+                                    if hasattr(event.content_block, "id"):
+                                        tool_id = event.content_block.id
+                        
+                        elif event_type == 'content_block_delta':
+                            # Content delta event
+                            if hasattr(event, "delta") and hasattr(event.delta, "type"):
+                                if event.delta.type == 'text_delta':
+                                    if hasattr(event.delta, "text"):
+                                        message_text += event.delta.text
+                                        yield event.delta.text
+                                elif event.delta.type == 'input_json_delta':
+                                    if hasattr(event.delta, "partial_json"):
+                                        tool_args += event.delta.partial_json
+                                else:
+                                    logger.warning(f"Unhandled content_block_delta: {event.delta.type}")
+                        
+                        elif event_type == 'tool_use':
+                            # Tool use event - just log it
+                            logger.debug(f"tool_use event received")
+                        
+                        elif event_type == 'message_delta':
+                            # Message delta event - log details
+                            logger.debug(f"Message delta received")
+                        
+                        elif event_type == 'message_stop':
+                            # Message stop event
+                            logger.debug("Received message_stop event")
+                        
+                        elif event_type == 'content_block_stop':
+                            # Content block stop event
+                            logger.debug("Received content_block_stop event")
+                        
+                        else:
+                            logger.warning(f"Event not handled: {event_type}")
+                    else:
+                        logger.warning(f"Event has no type attribute: {event}")
             else:
-                logger.warning(f"event not handled: {event}")
-
-        if tool_args:
-            import json
+                # Handle non-async-iterable response
+                yield "Error: Streaming response is not in expected format"
+                return
+        
+        except Exception as e:
+            logger.exception(f"Error in stream processing: {e}")
+            yield f"\n[Error: {str(e)}]\n"
+            
+        # Process tool if we received one
+        if tool_args and tool_name is not None and tool_id is not None:
             try:
-                tool_args_dict = json.loads(tool_args)
-            except json.JSONDecodeError:
-                logger.error(f"could not decode: {tool_args}")
-                tool_args_dict = {}
-
-        if tool_name is not None:
-            try:
-                logger.debug(f"will call {tool_name} with {tool_args_dict}")
+                # Parse tool arguments
+                try:
+                    tool_args_dict = json.loads(tool_args)
+                except json.JSONDecodeError:
+                    logger.error(f"Could not decode tool arguments: {tool_args}")
+                    tool_args_dict = {}
+                
+                logger.debug(f"Will call {tool_name} with {tool_args_dict}")
                 tool_result = await self.call_tool(tool_name, tool_args_dict)
 
                 # Add tool result to messages
@@ -329,6 +495,7 @@ class MCPClient:
                 })
 
                 yield f"\n[Tool result: {result_text}]\n"
+                
                 # Continue the conversation with the tool result
                 async for chunk in self._process_query(messages, system_prompt, temperature, stream, all_tools):
                     yield chunk
@@ -336,8 +503,15 @@ class MCPClient:
                 logger.exception(f"Error calling tool: {ex}")
                 yield f"\n[Error executing tool {tool_name}: {str(ex)}]\n"
 
-
     async def cleanup(self):
         """Clean up resources and connections."""
         await self.exit_stack.aclose()
         logger.debug("Cleaned up MCP client resources")
+        
+    async def close(self):
+        """Alias for cleanup() for compatibility."""
+        await self.cleanup()
+        
+    async def aclose(self):
+        """Alias for cleanup() for compatibility."""
+        await self.cleanup()
