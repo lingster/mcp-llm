@@ -10,6 +10,8 @@ from contextlib import aclosing, AsyncExitStack
 from loguru import logger
 from mcp_llm.client.litellm import MCPClient
 
+MODEL = "ollama_chat/qwen3:32b-fp16"
+OLLAMA_BASE_URL = "http://10.13.1.11:11434"
 
 async def main() -> None:
     """Run a test query against the MCP client with proper error handling."""
@@ -22,8 +24,8 @@ async def main() -> None:
         try:
             # Initialize client with proper error handling
             client = MCPClient(
-                model="ollama_chat/qwen2.5:32b",
-                base_url="http://10.13.1.11:11434"
+                model=MODEL,
+                base_url=OLLAMA_BASE_URL
             )
             
             # Register the client's cleanup method with our exit stack
