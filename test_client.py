@@ -42,7 +42,15 @@ async def main() -> None:
             # Process query
             query = "what's in /data directory?"
             logger.info(f"Running query: {query}")
-            
+            async with aclosing(client.process_query(query, stream=False)) as query_gen:
+                try:
+                    async for chunk in query_gen:
+                        print(chunk, flush=True)
+                except Exception as ex:
+                    logger.error(f"Error: {ex}")
+
+
+
             # Properly handle streaming response
             async with aclosing(client.process_query(query)) as query_gen:
                 try:

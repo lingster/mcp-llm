@@ -275,7 +275,7 @@ class MCPClient:
             # Add the tool result to messages
             messages.append(
                 {
-                    "role": "tool",
+                    "role": "user",
                     "tool_call_id": tool_id,
                     "name": tool_name,
                     "content": result_text,
@@ -304,7 +304,7 @@ class MCPClient:
 
             messages.append(
                 {
-                    "role": "tool",
+                    "role": "user",
                     "tool_call_id": tool_id,
                     "name": tool_name,
                     "content": error_message,
@@ -431,6 +431,10 @@ class MCPClient:
                         yield f"\n[Tool result: {result_text}]\n"
 
                         # Continue the conversation with the tool result
+                        # async for chunk in self._process_streaming_query(updated_messages, tools, temperature):
+                        #     delta = chunk.choices[0].delta
+                        #     if hasattr(delta, "content") and delta.content:
+                        #         yield delta.content
                         final_response = await litellm.acompletion(
                             model=self.model,
                             messages=updated_messages,
