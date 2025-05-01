@@ -1,13 +1,13 @@
-from enum import Enum
 import os
 import sys
 import json
+import time
+import asyncio
 from loguru import logger
 from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional, AsyncGenerator, Tuple, Union, cast
 
 import litellm
-from litellm.utils import StreamingChoices
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import Resource, Tool
@@ -16,6 +16,29 @@ from ..config import MCPConfig
 
 logger.remove()
 logger.add(sys.stderr, level="INFO")
+
+litellm.model_map = {
+    "openai/qwen3:32b": {
+        "max_tokens": 32768,
+        "max_input_tokens": 32768,
+        "max_output_tokens": 32768,
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "litellm_provider": "openai",
+        "mode": "chat",
+        "supports_function_calling": True,
+    },
+    "qwen3:32b": {
+        "max_tokens": 32768,
+        "max_input_tokens": 32768,
+        "max_output_tokens": 32768,
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "litellm_provider": "openai",
+        "mode": "chat",
+        "supports_function_calling": True,
+    }
+}
 
 
 class MCPClient:
@@ -30,7 +53,8 @@ class MCPClient:
         api_key: Optional[str] = None,
         model: str = "anthropic/claude-3-7-sonnet-20241024",
         max_tokens: int = 4096,
-        base_url: Optional[str] = None
+        base_url: Optional[str] = None,
+        debug: bool = False,
     ):
         """Initialize the MCP client.
 
@@ -45,28 +69,32 @@ class MCPClient:
         self.model = model
         self.max_tokens = max_tokens
         self.base_url = base_url
+
+        if debug:
+            litellm._turn_on_debug()
+
         
         # Set API key based on model provider
         if base_url:
             litellm.api_base = base_url
+
+        # Extract provider from model string
+        provider = model.split('/')[0] if '/' in model else None
+        env_var_name = f"{provider.upper()}_API_KEY" if provider else "LITELLM_API_KEY"
+
+        self.api_key = api_key or os.environ.get(env_var_name) or os.environ.get("OPENAI_API_KEY")
+
+        if not self.api_key:
+            raise ValueError(f"API key is required. Set {env_var_name} env var or pass it to the constructor.")
+
+        # Configure LiteLLM with the appropriate API key
+        if provider and provider.lower() == "anthropic":
+            os.environ["ANTHROPIC_API_KEY"] = self.api_key
+        elif provider and provider.lower() == "openai":
+            os.environ["OPENAI_API_KEY"] = self.api_key
         else:
-            # Extract provider from model string
-            provider = model.split('/')[0] if '/' in model else None
-            env_var_name = f"{provider.upper()}_API_KEY" if provider else "LITELLM_API_KEY"
-            
-            self.api_key = api_key or os.environ.get(env_var_name) or os.environ.get("OPENAI_API_KEY")
-            
-            if not self.api_key:
-                raise ValueError(f"API key is required. Set {env_var_name} env var or pass it to the constructor.")
-            
-            # Configure LiteLLM with the appropriate API key
-            if provider and provider.lower() == "anthropic":
-                os.environ["ANTHROPIC_API_KEY"] = self.api_key
-            elif provider and provider.lower() == "openai":
-                os.environ["OPENAI_API_KEY"] = self.api_key
-            else:
-                # For other providers or if no provider specified
-                litellm.api_key = self.api_key
+            # For other providers or if no provider specified
+            litellm.api_key = self.api_key
 
         # MCP server connections and state
         self.exit_stack = AsyncExitStack()
@@ -162,7 +190,7 @@ class MCPClient:
         Returns:
             Tool execution result
         """
-        logger.debug(f"Calling tool: {full_tool_name} with args: {arguments}")
+        logger.info(f"Calling tool: {full_tool_name} with args: {arguments}")
         logger.debug(f"Available tool map: {self.tool_map}")
         
         if full_tool_name in self.tool_map:
@@ -283,8 +311,109 @@ class MCPClient:
             })
             
             return error_message, messages
-    
-    async def process_query(
+
+    def process_query(self,
+                query: str,
+                system_prompt: str = "You are a helpful assistant.",
+                temperature: float = 0.7,
+                tools: Optional[List[str]] = None,
+                ) -> str:
+        """Process a query using LiteLLM and available tools.
+
+        Args:
+            query: User query to process
+            system_prompt: Optional system prompt
+            temperature: Temperature for model generation
+            tools: Optional list of tools
+
+        Returns:
+            Final response from the model after processing all tool calls
+        """
+        if not tools:
+            tools = self.get_available_tools()
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": query}
+        ]
+
+        # Synchronous implementation - run until we get a final response
+        final_response = ""
+        
+        # We need to handle multiple turns of conversation potentially
+        while True:
+            # Call LLM with current messages
+            start_time = time.monotonic()
+            #logger.info(f"Calling LLM with messages: {messages}")
+            response = litellm.completion(
+                model=self.model,
+                messages=messages,
+                max_tokens=self.max_tokens,
+                temperature=temperature,
+                tools=tools,
+                tool_choice="auto",
+                api_base=self.base_url,
+            )
+            logger.info(f"Received response: in {time.monotonic() - start_time:.2f}s")
+            
+            # Check if we have tool calls
+            if hasattr(response.choices[0].message, 'tool_calls') and response.choices[0].message.tool_calls:
+                for tool_call in response.choices[0].message.tool_calls:
+                    tool_name = tool_call.function.name
+                    tool_args_str = tool_call.function.arguments
+                    tool_id = tool_call.id
+
+                    try:
+                        # Call the tool and update messages
+                        tool_args_dict = json.loads(tool_args_str)
+                        # We need to run the async function in a synchronous context
+                        tool_result = asyncio.run(self.call_tool(tool_name, tool_args_dict))
+                        
+                        result_text = tool_result.get("text", "Tool executed successfully")
+                        if tool_result.get("error"):
+                            result_text = f"Error executing tool: {result_text}"
+                        
+                        logger.debug(f"[Tool result: {result_text}]")
+                    except Exception as ex:
+                        logger.exception(f"Error calling tool: {ex}")
+                        result_text = f"Error executing tool {tool_name}: {str(ex)}"
+                        print(f"[Tool error: {result_text}]")
+                    
+                    # Add the tool call to messages
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": tool_args_str
+                            }
+                        }]
+                    })
+                    
+                    # Add the tool result to messages
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "name": tool_name,
+                        "content": result_text
+                    })
+                    
+                # Continue the loop to make another LLM call with the updated messages
+                continue
+            else:
+                # No tool calls means we have a final response
+                if hasattr(response.choices[0], 'message') and hasattr(response.choices[0].message, 'content'):
+                    final_response = response.choices[0].message.content
+                break
+        
+        return final_response
+
+
+
+    async def aprocess_query(
         self,
         query: str,
         system_prompt: str = "You are a helpful assistant.",
